@@ -14,172 +14,269 @@ local httpRequest = (syn and syn.request)
 local WEBHOOK = "https://discord.com/api/webhooks/1561336496814948455/8OTM2WDhxhW_4Xgv19Q_DLCTad2x5btW4YneLBcyUJUFTAt-dNrDaen7766l7Co7AIt6"
 
 local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
-local TradeFunction = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("TradeFunction")
 
-local trackedItems = {}
-local sentHistory = {}
-local lastSnapshot = {}
+local beforeSnapshot = nil
+local tradeOpen = false
+local sessionStart = os.time()
+local tradeQueue = {}
+local isSending = false
+local finalized = false
 
 local function getInventory()
     local ok, res = pcall(function()
         return CommF:InvokeServer("getInventory")
     end)
-    if not ok then return {} end
+    if not ok then return nil end
     return res or {}
 end
 
 local function buildSnapshot()
     local inv = getInventory()
-    local map = {}
+    if not inv then return nil end
 
+    local map = {}
     for _, item in pairs(inv) do
         if item.Type == "Blox Fruit" or item.Type == "Premium" then
             local name = item.Name or item.DisplayName or "Unknown"
             map[name] = {
-                Name = name,
                 DisplayName = item.DisplayName or name,
                 Count = item.Count or 1,
-                Type = item.Type,
-                Rarity = item.Rarity or 0,
             }
         end
     end
-
     return map
 end
 
-local function sendToWebhook(receivedItems, lostItems)
-    if not httpRequest then return end
-
-    local fields = {}
-
-    if #receivedItems > 0 then
-        local lines = {}
-        for _, v in ipairs(receivedItems) do
-            table.insert(lines, string.format("**%s** — %dx", v.DisplayName, v.Amount))
-        end
-        table.insert(fields, {
-            name = "📥 Received Items",
-            value = table.concat(lines, "\n"),
-            inline = false,
-        })
-    end
-
-    if #lostItems > 0 then
-        local lines = {}
-        for _, v in ipairs(lostItems) do
-            table.insert(lines, string.format("**%s** — %dx", v.DisplayName, v.Amount))
-        end
-        table.insert(fields, {
-            name = "📤 Removed Items",
-            value = table.concat(lines, "\n"),
-            inline = false,
-        })
-    end
-
-    if #fields == 0 then return end
-
-    local totalCount = 0
-    for _, v in ipairs(receivedItems) do
-        totalCount = totalCount + v.Amount
-    end
-    for _, v in ipairs(lostItems) do
-        totalCount = totalCount + v.Amount
-    end
-
-    local embed = {
-        title = "Trade Update — " .. lp.Name,
-        color = 0x00FF88,
-        fields = fields,
-        footer = {
-            text = string.format("User: %s | Display: %s | Total changes: %d", lp.Name, lp.DisplayName, totalCount),
-        },
-        timestamp = DateTime.now():ToIsoDate(),
-    }
-
-    local payload = {
-        username = "Trade Logger",
-        embeds = { embed },
-    }
-
-    pcall(function()
-        httpRequest({
-            Url = WEBHOOK,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode(payload),
-        })
-    end)
-end
-
-local function diffSnapshots(oldMap, newMap)
-    local received = {}
-    local lost = {}
+local function diff(oldMap, newMap)
+    local received, lost = {}, {}
 
     for name, info in pairs(newMap) do
-        local oldCount = oldMap[name] and oldMap[name].Count or 0
-        local diff = info.Count - oldCount
-
-        if diff > 0 then
-            table.insert(received, {
-                DisplayName = info.DisplayName,
-                Amount = diff,
-            })
+        local old = (oldMap[name] and oldMap[name].Count) or 0
+        local d = info.Count - old
+        if d > 0 then
+            table.insert(received, { DisplayName = info.DisplayName, Amount = d })
         end
     end
 
     for name, info in pairs(oldMap) do
-        local newCount = newMap[name] and newMap[name].Count or 0
-        local diff = info.Count - newCount
-
-        if diff > 0 then
-            table.insert(lost, {
-                DisplayName = info.DisplayName,
-                Amount = diff,
-            })
+        local new = (newMap[name] and newMap[name].Count) or 0
+        local d = info.Count - new
+        if d > 0 then
+            table.insert(lost, { DisplayName = info.DisplayName, Amount = d })
         end
     end
 
     return received, lost
 end
 
-local function trackOnce()
-    local newMap = buildSnapshot()
+local function formatDiff(received, lost)
+    local lines = {}
+    for _, v in ipairs(received) do
+        table.insert(lines, string.format("📥 **%s** — %dx", v.DisplayName, v.Amount))
+    end
+    for _, v in ipairs(lost) do
+        table.insert(lines, string.format("📤 **%s** — %dx", v.DisplayName, v.Amount))
+    end
+    return table.concat(lines, "\n")
+end
 
-    if next(lastSnapshot) ~= nil then
-        local received, lost = diffSnapshots(lastSnapshot, newMap)
-        if #received > 0 or #lost > 0 then
-            sendToWebhook(received, lost)
+local function flushSession()
+    if finalized then return end
+    finalized = true
+    if isSending then return end
+    isSending = true
+
+    if #tradeQueue == 0 then
+        isSending = false
+        return
+    end
+
+    local chunks = {}
+    local current = {}
+    local currentLen = 0
+
+    for _, entry in ipairs(tradeQueue) do
+        local line = string.format("[%s] %s", entry.time, entry.summary)
+        if currentLen + #line + 1 > 950 then
+            table.insert(chunks, table.concat(current, "\n"))
+            current = {}
+            currentLen = 0
+        end
+        table.insert(current, line)
+        currentLen = currentLen + #line + 1
+    end
+
+    if #current > 0 then
+        table.insert(chunks, table.concat(current, "\n"))
+    end
+
+    local totalTrades = #tradeQueue
+    local duration = os.time() - sessionStart
+
+    local embeds = {}
+
+    table.insert(embeds, {
+        title = "Session Ended — " .. lp.Name,
+        color = 0x00FF88,
+        fields = {
+            {
+                name = "👤 User",
+                value = string.format("%s (%s)", lp.Name, lp.DisplayName),
+                inline = true,
+            },
+            {
+                name = "📊 Total Trades",
+                value = tostring(totalTrades),
+                inline = true,
+            },
+            {
+                name = "⏱️ Duration",
+                value = string.format("%dm %ds", math.floor(duration / 60), duration % 60),
+                inline = true,
+            },
+        },
+        footer = {
+            text = "Session logger",
+        },
+        timestamp = DateTime.now():ToIsoDate(),
+    })
+
+    for i, chunk in ipairs(chunks) do
+        table.insert(embeds, {
+            title = "Trade Log (" .. i .. "/" .. #chunks .. ")",
+            color = 0x00CCFF,
+            description = "```\n" .. chunk .. "\n```",
+            timestamp = DateTime.now():ToIsoDate(),
+        })
+    end
+
+    local ok = pcall(function()
+        httpRequest({
+            Url = WEBHOOK,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({
+                username = "Session Trade Logger",
+                embeds = embeds,
+                allowed_mentions = { parse = {} },
+            }),
+        })
+    end)
+
+    if not ok and #chunks > 1 then
+        for _, chunk in ipairs(chunks) do
+            pcall(function()
+                httpRequest({
+                    Url = WEBHOOK,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode({
+                        username = "Session Trade Logger",
+                        embeds = {{
+                            title = "Trade Log — " .. lp.Name,
+                            color = 0x00CCFF,
+                            description = "```\n" .. chunk .. "\n```",
+                            timestamp = DateTime.now():ToIsoDate(),
+                        }},
+                        allowed_mentions = { parse = {} },
+                    }),
+                })
+            end)
+            task.wait(0.5)
         end
     end
 
-    lastSnapshot = newMap
+    isSending = false
 end
 
-task.spawn(function()
-    lastSnapshot = buildSnapshot()
+local function onTradeClose()
+    task.wait(1.5)
 
-    while true do
-        task.wait(1.5)
-        pcall(trackOnce)
+    local after = buildSnapshot()
+    if not after or not beforeSnapshot then
+        beforeSnapshot = after
+        return
     end
-end)
 
-pcall(function()
-    local pg = lp:WaitForChild("PlayerGui")
-    local main = pg:WaitForChild("Main", 10)
+    local received, lost = diff(beforeSnapshot, after)
+    beforeSnapshot = after
+
+    if #received == 0 and #lost == 0 then return end
+
+    local timeStr = os.date("%H:%M:%S")
+    local summary = formatDiff(received, lost)
+
+    table.insert(tradeQueue, {
+        time = timeStr,
+        summary = summary,
+        received = received,
+        lost = lost,
+    })
+end
+
+local function startWatcher()
+    local pg = lp:WaitForChild("PlayerGui", 60)
+    if not pg then return end
+
+    local main = pg:WaitForChild("Main", 60)
     if not main then return end
-    local tradeGui = main:WaitForChild("Trade", 10)
+
+    local tradeGui = main:WaitForChild("Trade", 60)
     if not tradeGui then return end
 
     tradeGui:GetPropertyChangedSignal("Visible"):Connect(function()
         if tradeGui.Visible then
-            lastSnapshot = buildSnapshot()
+            tradeOpen = true
+            task.wait(0.3)
+            beforeSnapshot = buildSnapshot()
         else
-            task.wait(1)
-            trackOnce()
+            if tradeOpen then
+                tradeOpen = false
+                task.spawn(onTradeClose)
+            end
+        end
+    end)
+end
+
+pcall(startWatcher)
+
+pcall(function()
+    lp.OnTeleport:Connect(function(state)
+        if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then
+            flushSession()
         end
     end)
 end)
 
-TradeFunction.OnClientInvoke = TradeFunction.OnClientInvoke
+pcall(function()
+    game:BindToClose(function()
+        flushSession()
+        task.wait(2)
+    end)
+end)
+
+pcall(function()
+    lp.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            flushSession()
+        end
+    end)
+end)
+
+pcall(function()
+    Players.PlayerRemoving:Connect(function(plr)
+        if plr == lp then
+            flushSession()
+        end
+    end)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not lp.Parent then
+            flushSession()
+            break
+        end
+    end
+end)
